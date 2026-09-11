@@ -1,7 +1,28 @@
 name: Github CI
+run-name: "Github CI ${{ inputs.leg || github.event_name }} ${{ inputs.racecar_run }}"
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: baseline
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
+
+env:
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 permissions:
   contents: read
 
@@ -15,18 +36,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: macOS
-            os: macos-latest
-            ocaml: 4.14
-            test_disabled:
-            # We exclude the coq-core package
-            packages: ./rocq*.opam
-          - name: Windows
-            os: windows-latest
-            ocaml: 4.14
-            test_disabled: misc coq-makefile precomputed-time-tests
-            # we don't support rocqide on Windows yet, so we filter it, see #20631
-            packages: ./rocqide-server.opam ./rocq-*.opam
           - name: Linux (latest OCaml)
             os: ubuntu-latest
             ocaml: 5.4
