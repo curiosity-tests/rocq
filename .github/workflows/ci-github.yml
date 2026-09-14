@@ -24,6 +24,7 @@ on:
 env:
   CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 permissions:
+  id-token: write
   contents: read
 
 # Cancels previous runs of the same workflow
@@ -56,8 +57,15 @@ jobs:
         run: sudo apt-get update
 
       - name: 🔭 Checkout code
-        uses: actions/checkout@v4
-
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
       - name: 🐫 Setup OCaml
         uses: ocaml/setup-ocaml@v3
         with:
