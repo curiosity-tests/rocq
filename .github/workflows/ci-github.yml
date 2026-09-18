@@ -37,41 +37,36 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: Linux (latest OCaml)
-            os: ubuntu-latest
-            ocaml: 5.4
-            test_disabled:
-            packages: ./rocq*.opam
+        - name: Linux (latest OCaml)
+          os: ubuntu-latest
+          ocaml: 5.4
+          test_disabled:
+          packages: ./rocq*.opam
       fail-fast: false
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - name: 🐛 Special macOS Config
-        if: matrix.os == 'macos-latest'
-        run: brew install gnu-time
+    - name: 🐛 Special macOS Config
+      if: matrix.os == 'macos-latest'
+      run: brew install gnu-time
 
-      - name: APT update
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update
+    - name: APT update
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get update
 
-      - name: 🔭 Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        continue-on-error: true
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-      - name: 🐫 Setup OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: ${{ matrix.ocaml }}
-          dune-cache: true
+    - name: 🔭 Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: 🐫 Setup OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: ${{ matrix.ocaml }}
+        dune-cache: true
 
       # Cygwin's pkgconf 3.0.4-1 (2026-07-26) compiles its personality search
       # path as /usr/lib/pkgconfig/personality.d:/usr/share/pkgconfig/personality.d
@@ -82,16 +77,93 @@ jobs:
       # also searches $XDG_DATA_DIRS/pkgconfig/personality.d, so prepending /etc
       # restores the lookup.  Drop this once Cygwin ships a fixed pkgconf
       # packaging.
-      - name: 🩹 Work around Cygwin pkgconf 3.0.4-1 personality path bug
-        if: matrix.os == 'windows-latest'
-        run: |
-          "XDG_DATA_DIRS=/etc:/usr/local/share:/usr/share" >> $env:GITHUB_ENV
+    - name: 🩹 Work around Cygwin pkgconf 3.0.4-1 personality path bug
+      if: matrix.os == 'windows-latest'
+      run: |
+        "XDG_DATA_DIRS=/etc:/usr/local/share:/usr/share" >> $env:GITHUB_ENV
 
-      - name: 🐫🐪🐫 Get Rocq dependencies
-        run: opam install --deps-only ${{ matrix.packages }}
+    - name: 🐫🐪🐫 Get Rocq dependencies
+      run: opam install --deps-only ${{ matrix.packages }}
 
-      - name: 🧱 Build Rocq
-        run: opam exec -- make world
+    - name: 🧱 Build Rocq
+      run: opam exec -- make world
 
-      - name: 🐛 Test Rocq
-        run: opam exec -- make -j 4 -C test-suite TIMED=1 DISABLED_SUBSYSTEMS='${{ matrix.test_disabled }}'
+    - name: 🐛 Test Rocq
+      run: opam exec -- make -j 4 -C test-suite TIMED=1 DISABLED_SUBSYSTEMS='${{ matrix.test_disabled }}'
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
